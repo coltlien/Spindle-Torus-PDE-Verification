@@ -21,13 +21,33 @@ import matplotlib.pyplot as plt
 def compute_vortex_lensing_ode(V_0_kms=220.0, R_c_kpc=2.5, b_max_kpc=30.0):
     c_kms = 299792.458
     rad_to_arcsec = (180.0 / np.pi) * 3600.0
+    gamma_euler = 0.5772156649015329
 
-    r_grid = np.logspace(-3, 4, 4000)
-    dr = np.gradient(r_grid)
-    integrand = (1.0 / r_grid) * (1.0 - np.exp(-(r_grid / R_c_kpc) ** 2))
-    omega_z = np.exp(-np.cumsum(integrand * dr))
-    v_raw = np.cumsum(r_grid * omega_z * dr) / r_grid
-    v_vor_grid = V_0_kms * (v_raw / v_raw[-1])
+    # Integrate exact Corollary 2 ODE with analytical omega_0 = (V_0 / R_c) * exp(gamma_E / 2)
+    omega_0 = (V_0_kms / R_c_kpc) * np.exp(0.5 * gamma_euler)
+
+    def corollary2_ode(r, y):
+        # y[0] = omega_z(r), y[1] = R * v_vortex(R) = int_0^R r' omega_z(r') dr'
+        om = y[0]
+        d_om = -(om / r) * (1.0 - np.exp(-((r / R_c_kpc) ** 2))) if r > 1e-8 else 0.0
+        d_circ = r * om
+        return [d_om, d_circ]
+
+    r_grid = np.logspace(-3, 3.5, 3000)
+    sol_vor = solve_ivp(
+        corollary2_ode, (r_grid[0], r_grid[-1]),
+        [omega_0, 0.5 * omega_0 * (r_grid[0] ** 2)],
+        t_eval=r_grid, rtol=1e-10, atol=1e-12
+    )
+    v_vor_grid = sol_vor.y[1] / sol_vor.t
+
+    def accel_over_R(R_val):
+        M_enc_norm = (R_val ** 3) / ((R_val ** 2 + R_c_kpc ** 2) ** 1.5)
+        v_bar_sq = ((0.92 * V_0_kms) ** 2) * (2.0 * R_c_kpc * M_enc_norm / R_val)
+        g_bar_R = v_bar_sq / (R_val ** 2)
+        v_vor_val = np.interp(R_val, r_grid, v_vor_grid)
+        dP_vor_R = (v_vor_val ** 2) / (R_val ** 2)
+        return g_bar_R, dP_vor_R
 
     b_vals = np.linspace(0.5, b_max_kpc, 50)
     theta_baryon_arcsec = np.zeros_like(b_vals)
@@ -42,12 +62,7 @@ def compute_vortex_lensing_ode(V_0_kms=220.0, R_c_kpc=2.5, b_max_kpc=30.0):
         dx_deta = b * np.cosh(eta)
         R_path = np.sqrt(x_line ** 2 + b ** 2)
 
-        M_enc_norm = (R_path ** 3) / ((R_path ** 2 + R_c_kpc ** 2) ** 1.5)
-        v_bar_sq = ((0.92 * V_0_kms) ** 2) * (2.0 * R_c_kpc * M_enc_norm / R_path)
-        g_bar_over_R = v_bar_sq / (R_path ** 2)
-
-        v_vor_path = np.interp(R_path, r_grid, v_vor_grid)
-        dP_vor_over_R = (v_vor_path ** 2) / (R_path ** 2)
+        g_bar_over_R, dP_vor_over_R = accel_over_R(R_path)
 
         defl_bar = (2.0 / (c_kms ** 2)) * np.sum(g_bar_over_R * b * dx_deta) * d_eta
         defl_vor = (2.0 / (c_kms ** 2)) * np.sum(dP_vor_over_R * b * dx_deta) * d_eta
@@ -58,18 +73,26 @@ def compute_vortex_lensing_ode(V_0_kms=220.0, R_c_kpc=2.5, b_max_kpc=30.0):
 
     theta_inf_arcsec = 2.0 * np.pi * ((V_0_kms / c_kms) ** 2) * rad_to_arcsec
 
-    x_ray = np.linspace(-25.0, 25.0, 400)
+    # Integrate actual null-geodesic ray ODE: d^2y/dx^2 = -M_vis * (2/c^2) * (dPhi_eff/dR) * (y/R)
+    x_span = (-25.0, 25.0)
+    x_ray = np.linspace(-25.0, 25.0, 300)
+    vis_scale = 2.2e4  # Explicit visual magnification so ~0.7 arcsec deflection is visible at kpc scale
     b_rays = np.linspace(-18.0, 18.0, 18)
     ray_paths = []
+
     for b0 in b_rays:
         if abs(b0) < 0.8:
             continue
-        sign_b = np.sign(b0)
-        defl_visual = 3.2 * (1.0 + 1.5 / (abs(b0) + 1.2))
-        y_traj = b0 - sign_b * defl_visual * ((x_ray + 25.0) / 50.0) * (
-            0.5 + (1.0 / np.pi) * np.arctan(x_ray / abs(b0))
-        )
-        ray_paths.append((x_ray, y_traj))
+
+        def ray_ode(x, state):
+            y_pos, dy_dx = state
+            R_curr = np.sqrt(x ** 2 + y_pos ** 2 + 0.15 ** 2)
+            g_b, dP_v = accel_over_R(R_curr)
+            d2y_dx2 = -vis_scale * (2.0 / (c_kms ** 2)) * (g_b + dP_v) * y_pos
+            return [dy_dx, d2y_dx2]
+
+        sol_ray = solve_ivp(ray_ode, x_span, [b0, 0.0], t_eval=x_ray, rtol=1e-8, atol=1e-10)
+        ray_paths.append((sol_ray.t, sol_ray.y[0]))
 
     return b_vals, theta_baryon_arcsec, theta_vortex_arcsec, theta_total_arcsec, theta_inf_arcsec, ray_paths
 
@@ -178,7 +201,7 @@ def launch_tests_3_and_4():
             circle = plt.Circle((0, 0), 2.5, color='yellow', fill=False, ls='--', lw=2.0, label='Core Horizon $R_c = 2.5$ kpc')
             ax1.add_patch(circle)
             ax1.set_xlim([-25, 25]); ax1.set_ylim([-19, 19])
-            ax1.set_title("(a) Null-Geodesic Ray Refraction Across $P_{\\mathrm{vortex}}(R) \\propto \\ln(R/R_c)$",
+            ax1.set_title("(a) Null-Geodesic Ray ODE Integration Across $P_{\\mathrm{vortex}}(R) \\propto \\ln(R/R_c)$",
                           color='white', fontsize=11, fontweight='bold')
             ax1.set_xlabel("Propagation Axis $x$ (kpc)", color='white', fontsize=10.5)
             ax1.set_ylabel("Impact Parameter Axis $y$ (kpc)", color='white', fontsize=10.5)
