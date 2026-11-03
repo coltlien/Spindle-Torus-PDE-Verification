@@ -7,6 +7,7 @@ in an Axisymmetric Navier-Stokes Suction Vortex (Zero Dark Matter).
 
 import os
 import numpy as np
+from scipy.integrate import solve_ivp
 import scipy.sparse as sp
 import scipy.sparse.linalg as sla
 import matplotlib.pyplot as plt
@@ -17,8 +18,7 @@ def solve_homogeneous_euler_cauchy_vortex(R_min=1.0, R_max=30.0, Nr=600,
     """
     Solves the homogeneous 1D azimuthal Navier-Stokes ODE (RHS = 0):
         d^2 v_theta / dR^2 + ((1 + Re_s) / R) dv_theta / dR - ((1 - Re_s) / R^2) v_theta = 0
-    via second-order central finite differences (with a second-order ghost node at R_max)
-    and compares against the exact analytical solution (R / R_min)^(1 - Re_s).
+    via second-order central finite differences and compares against (R / R_min)^(1 - Re_s).
     """
     R = np.linspace(R_min, R_max, Nr)
     dR = R[1] - R[0]
@@ -30,11 +30,9 @@ def solve_homogeneous_euler_cauchy_vortex(R_min=1.0, R_max=30.0, Nr=600,
         lower = np.zeros(Nr - 1)
         rhs = np.zeros(Nr)
 
-        # Inner Horizon Boundary Condition: v_theta(R_min) = 1.0
         main[0] = 1.0
         rhs[0] = 1.0
 
-        # Interior Homogeneous Navier-Stokes Operator (RHS = 0)
         for i in range(1, Nr - 1):
             Ri = R[i]
             adv = (1.0 + Re_s) / Ri
@@ -45,8 +43,6 @@ def solve_homogeneous_euler_cauchy_vortex(R_min=1.0, R_max=30.0, Nr=600,
             upper[i] = (1.0 / dR ** 2) + (adv / (2.0 * dR))
             rhs[i] = 0.0
 
-        # Second-order central Robin outflow BC at R_max: R * dv/dR = (1 - Re_s) * v
-        # Ghost node: v_{N} = v_{N-2} + 2*dR*((1 - Re_s)/R_max)*v_{N-1}
         Rn = R[-1]
         adv_n = (1.0 + Re_s) / Rn
         pot_n = -(1.0 - Re_s) / (Rn ** 2)
@@ -68,30 +64,31 @@ def solve_homogeneous_euler_cauchy_vortex(R_min=1.0, R_max=30.0, Nr=600,
 
 def solve_nonsingular_galactic_composite(r_max_kpc=30.0, Nr=600, R_c_kpc=2.5, V_0_kms=200.0):
     """
-    Solves the non-singular distributed-core Navier-Stokes suction vortex (Re_s = 1.0)
-    where u_R(R) = -(v_s * R_c / R) * (1 - exp(-(R / R_c)^2)), ensuring regularity at R = 0:
-        d(omega_z)/dR = -(Re_s / R) * (1 - exp(-(R / R_c)^2)) * omega_z
-        (1/R) d(R v_vortex)/dR = omega_z(R)
-    and combines it with a Newtonian baryonic core via radial momentum balance:
-        v_total^2(R) = v_baryon^2(R) + v_vortex^2(R).
+    Integrates the non-singular distributed-core Navier-Stokes suction vortex (Re_s = 1.0)
+    directly from R -> 0 using the analytical Corollary 2 central vorticity
+    omega_0 = (V_0 / R_c) * exp(gamma_E / 2) without endpoint rescaling:
+        d(omega_z)/dR = -(1 / R) * (1 - exp(-(R / R_c)^2)) * omega_z
+        d(R * v_vortex)/dR = R * omega_z(R)
     """
     R = np.linspace(1e-3, r_max_kpc, Nr)
-    dR = R[1] - R[0]
-    Re_s = 1.0  # Critical ASBL condition: delta^* = nu_A / v_s = R_c
+    gamma_euler = 0.5772156649015329
+    omega_0 = (V_0_kms / R_c_kpc) * np.exp(0.5 * gamma_euler)
 
-    integrand = (Re_s / R) * (1.0 - np.exp(-(R / R_c_kpc) ** 2))
-    log_omega = -np.cumsum(integrand) * dR
-    omega_z = np.exp(log_omega)
+    def corollary2_ode(r, y):
+        om = y[0]
+        d_om = -(om / r) * (1.0 - np.exp(-((r / R_c_kpc) ** 2)))
+        d_circ = r * om
+        return [d_om, d_circ]
 
-    circulation = np.cumsum(R * omega_z) * dR
-    v_vortex_raw = circulation / R
-    v_vortex = V_0_kms * (v_vortex_raw / v_vortex_raw[-1])
+    sol = solve_ivp(
+        corollary2_ode, (R[0], R[-1]),
+        [omega_0, 0.5 * omega_0 * (R[0] ** 2)],
+        t_eval=R, rtol=1e-11, atol=1e-13
+    )
+    v_vortex = sol.y[1] / sol.t
 
-    # Pure Newtonian Baryonic Bulge + Disk (Plummer-Kuzmin profile, zero Dark Matter)
     M_baryon_enclosed = (R ** 3) / ((R ** 2 + R_c_kpc ** 2) ** 1.5)
     v_baryon = (0.92 * V_0_kms) * np.sqrt((2.0 * R_c_kpc * M_baryon_enclosed) / R)
-
-    # Radial Navier-Stokes Cyclostrophic + Gravitational Equilibrium
     v_total = np.sqrt(v_baryon ** 2 + v_vortex ** 2)
 
     return R, v_baryon, v_vortex, v_total
@@ -117,7 +114,6 @@ def generate_publication_figure():
             spine.set_edgecolor('white')
         ax.grid(True, ls='--', alpha=0.25, color='white')
 
-    # --- PANEL A: Homogeneous Navier-Stokes Suction Vortex Family ---
     palette = {
         0.75: ('#cc66ff', r'$Re_s = 0.75$ ($v_\theta \propto R^{+0.25}$ Rising Sheet)'),
         1.00: ('#00ffcc', r'$Re_s = 1.00$ ($\delta^* = R_c$: Exact Flat Curve $v_\theta = V_0$)'),
@@ -137,7 +133,6 @@ def generate_publication_figure():
     ax1.set_ylabel("Normalized Azimuthal Velocity $v_\\theta(R) / V_0$", color='white', fontsize=10.5)
     ax1.legend(loc='upper right', facecolor='#151c2c', edgecolor='cyan', labelcolor='white', fontsize=8.5)
 
-    # --- PANEL B: Non-Singular Galactic Rotation Curve (Baryons + Re_s = 1 Vortex) ---
     ax2.plot(R_gal, v_tot, color='#00ffcc', lw=3.0,
              label=r'Total Orbital Velocity $v_{\mathrm{total}}(R) = \sqrt{v_{\mathrm{baryon}}^2 + v_{\mathrm{vortex}}^2}$')
     ax2.plot(R_gal, v_vor, color='#3399ff', lw=2.2, ls='-.',
@@ -153,8 +148,6 @@ def generate_publication_figure():
     ax2.legend(loc='lower right', facecolor='#151c2c', edgecolor='cyan', labelcolor='white', fontsize=8.5)
 
     plt.tight_layout()
-
-    # Save directly into the same directory as this script (avoids macOS root read-only error)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_path = os.path.join(script_dir, "Figure_1_Navier_Stokes_Rotation.png")
     plt.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
